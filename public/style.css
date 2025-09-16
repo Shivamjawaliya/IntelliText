@@ -1,4 +1,4 @@
-.pop_up_button
+/* .pop_up_button
  {
     background-color: rgb(255, 115, 0);
     width: 100px;
@@ -27,4 +27,54 @@
 .pop_up_button:focus {
     outline: none;
     box-shadow: 0 0 0 3px rgba(76, 175, 80, 0.3);
+} */
+ /* Popup container */
+
+
+  #gemini-enhancer-popup {
+  position: absolute;
+  width: 100px;
+  height: 35px;
+  z-index: 10000;
+  text-transform: uppercase;
+  background-color: rgba(255, 255, 255, 0);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: medium;
+  font-weight: 500;
+  transition: 0.3s;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  display: none;
+  opacity: 0;
+  left: 0; /* Set dynamically in JS */
+  top: 0;  /* Set dynamically in JS */
+}
+
+/* Optional: style the button inside the popup */
+#gemini-enhancer-popup button {
+  background: #fff;
+  color: #1976d2;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 4px 12px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+#gemini-enhancer-popup button:hover {
+  background: #e3f2fd;
+}
+#gemini-enhancer-popup , #gemini-enhancer-popup button {
+  width: 100px;
+  height: 35px;
+  font-size: medium;
+  color: #1976d2;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
 }

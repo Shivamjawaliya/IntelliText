@@ -311,19 +311,19 @@ const showPopup = (element, currentInputText) => {
     popup.style.opacity = '1';
 
     // Set popup content - it will always be the Enhance button
-    popup.innerHTML = `
-  <div style="display: flex; flex-direction: column; align-items: flex-start; gap: 8px;">
-    <span style="font-size: 14px; font-weight: 500; margin-bottom: 4px;">✨ Instantly corrected</span>
-    <div style="display: flex; gap: 8px;">
-      <button class="pop_up_button" id="enhance-btn">
-        Enhance your text
-      </button>
-      <button class="pop_up_button secondary" id="no-thanks-btn" style="background: #fff; color: #d32f2f; border: 1px solid #d32f2f;">
-        No thanks
-      </button>
-    </div>
-  </div>
-`;
+//     popup.innerHTML = `
+//   <div style="display: flex; flex-direction: column; align-items: flex-start; gap: 8px;">
+//     <span style="font-size: 14px; font-weight: 500; margin-bottom: 4px;">✨ Instantly corrected</span>
+//     <div style="display: flex; gap: 8px;">
+//       <button class="pop_up_button" id="enhance-btn">
+//         Enhance your text
+//       </button>
+//       <button class="pop_up_button secondary" id="no-thanks-btn" style="background: #fff; color: #d32f2f; border: 1px solid #d32f2f;">
+//         No thanks
+//       </button>
+//     </div>
+//   </div>
+// `;
 
     console.log('Popup shown for:', element.tagName, 'at', `(${leftPos}, ${topPos})`, `Time: ${performance.now().toFixed(2)}ms`);
 };
@@ -418,19 +418,6 @@ function createPopup() {
     popup.id = 'gemini-enhancer-popup';
     popup.style.cssText = `
         position: absolute;
-        width: 100px;
-        height: 25px;
-        z-index: 10000;
-        text-transform: uppercase;
-        background-color:blue;
-        color: white;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-        font-size: 13px;
-        font-weight: 500;
-        transition: all 0.3s ease;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
     `;
     document.body.appendChild(popup);
     return popup;
@@ -568,7 +555,11 @@ popup.addEventListener('click', async function(e) {
 
     try {
         isProcessing = true;
-        popup.innerHTML = 'Processing...';
+
+
+        popup.innerHTML = '....';
+
+
         console.log('%c🤖 Calling Gemini API with stored textToEnhance:', 'color: #8D6E63', `"${textToEnhance}"`, `Time: ${performance.now().toFixed(2)}ms`); // Log the stored text and time
         const enhancedText = await enhanceTextWithGemini(textToEnhance, true); // Use textToEnhance for API call
         
