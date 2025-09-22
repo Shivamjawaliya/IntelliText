@@ -87,12 +87,12 @@ export default function Popup() {
 
       const tabId = tab.id;
       const doSend = () => {
-        chrome.tabs.sendMessage(
+      chrome.tabs.sendMessage(
           tabId,
-          { type: "PROMPT_FROM_POPUP", prompt },
-          (response) => {
-            if (chrome.runtime.lastError) {
-              setLastResponse({ success: false, error: chrome.runtime.lastError.message });
+        { type: "PROMPT_FROM_POPUP", prompt },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            setLastResponse({ success: false, error: chrome.runtime.lastError.message });
               return;
             }
             setLastResponse(response);
@@ -140,7 +140,7 @@ export default function Popup() {
           {restrictedInfo}
         </div>
       )}
-     
+
       <input
         className="popup-input"
         type="text"
@@ -162,7 +162,7 @@ export default function Popup() {
 
       {lastResponse && (
         <div
-          className={`response-msg ${lastResponse.success ? "success" : "error"}`}
+        className={`response-msg ${lastResponse.success ? "success" : "error"}`}
         >
           {lastResponse.success ? "Sent ✓" : `Failed: ${lastResponse.error || "unknown"}`}
         </div>
