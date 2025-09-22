@@ -11,6 +11,27 @@ let textChangeTimeout = null;
 let lastEnhancedText = '';
 let textToEnhance = '';
 
+// Enforce single concise output from the model
+const SINGLE_OUTPUT_SUFFIX = "\n\nConstraints: Respond with exactly one final rewrite/translation only. Do not include multiple options, bullets, quotes, examples, or explanations.";
+
+// Load saved prompt at startup for cross-tab persistence
+try {
+    chrome?.storage?.sync?.get({ savedPrompt: '' }, (res) => {
+        if (typeof res?.savedPrompt === 'string') {
+            window.__lastPopupPrompt = res.savedPrompt;
+            console.log('[content.js] Loaded savedPrompt from storage:', window.__lastPopupPrompt);
+        }
+    });
+} catch {}
+
+// Quick heartbeat for popup to detect content script presence
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message && message.type === 'PING') {
+        sendResponse({ ok: true });
+        return true;
+    }
+});
+
 function isValidInput(element) {
     const tagName = element.tagName;
     const isContentEditable = element.isContentEditable;
@@ -310,25 +331,12 @@ const showPopup = (element, currentInputText) => {
     popup.offsetHeight; // Trigger reflow
     popup.style.opacity = '1';
 
-    // Set popup content - it will always be the Enhance button
-//     popup.innerHTML = `
-//   <div style="display: flex; flex-direction: column; align-items: flex-start; gap: 8px;">
-//     <span style="font-size: 14px; font-weight: 500; margin-bottom: 4px;">✨ Instantly corrected</span>
-//     <div style="display: flex; gap: 8px;">
-//       <button class="pop_up_button" id="enhance-btn">
-//         Enhance your text
-//       </button>
-//       <button class="pop_up_button secondary" id="no-thanks-btn" style="background: #fff; color: #d32f2f; border: 1px solid #d32f2f;">
-//         No thanks
-//       </button>
-//     </div>
-//   </div>
-// `;
-
     console.log('Popup shown for:', element.tagName, 'at', `(${leftPos}, ${topPos})`, `Time: ${performance.now().toFixed(2)}ms`);
 };
 
 // Function to enhance text with Gemini API
+
+
 const enhanceTextWithGemini = async (text, hideAlert = false) => {
     if (!GEMINI_API_KEY) {
         console.error('Gemini API key is not set.');
@@ -338,10 +346,21 @@ const enhanceTextWithGemini = async (text, hideAlert = false) => {
         return null;
     }
 
-    const prompt = `Fix any grammatical errors and improve this text to be more professional, but keep it concise and only give option one: ${text}`;
+    // If the caller passed a full instruction (looks like an instruction + source text)
+    // detect common markers to avoid wrapping it again.
+    const looksLikeFinalPrompt = /source text:|translate to|translate into|translate|option 1:|fix any grammatical/i.test(text) || text.includes('{text}');
+    let finalPrompt = "";
+
+    if (looksLikeFinalPrompt) {
+        // Caller already built an instruction (or used {text}); use as-is
+        finalPrompt = text;
+    } else {
+        // Treat 'text' as the source text and apply default "fix grammar" instruction
+        finalPrompt = `Fix any grammatical errors and improve this text to be more professional, but keep it concise and only give option one: ${text}`;
+    }
 
     try {
-        const response = await callGeminiAPI(prompt, hideAlert);
+        const response = await callGeminiAPI(finalPrompt, hideAlert);
         if (response && response.candidates && response.candidates.length > 0) {
             const geminiResponseText = response.candidates[0].content.parts[0].text;
             const match = geminiResponseText.match(/Option 1:\s*(.*)/i);
@@ -556,12 +575,39 @@ popup.addEventListener('click', async function(e) {
     try {
         isProcessing = true;
 
-
         popup.innerHTML = '....';
 
+        // Build final prompt from saved/global prompt + current text
+        let userPrompt = typeof window.__lastPopupPrompt === 'string' ? window.__lastPopupPrompt : '';
+        try {
+            // Try to refresh from storage if empty
+            if (!userPrompt && chrome?.storage?.sync) {
+                await new Promise((resolve) => {
+                    chrome.storage.sync.get({ savedPrompt: '' }, (res) => {
+                        if (typeof res?.savedPrompt === 'string') {
+                            userPrompt = res.savedPrompt;
+                            window.__lastPopupPrompt = userPrompt;
+                        }
+                        resolve();
+                    });
+                });
+            }
+        } catch {}
 
-        console.log('%c🤖 Calling Gemini API with stored textToEnhance:', 'color: #8D6E63', `"${textToEnhance}"`, `Time: ${performance.now().toFixed(2)}ms`); // Log the stored text and time
-        const enhancedText = await enhanceTextWithGemini(textToEnhance, true); // Use textToEnhance for API call
+        let finalPrompt = '';
+        if (userPrompt && userPrompt.includes('{text}')) {
+            finalPrompt = userPrompt.replaceAll('{text}', textToEnhance);
+        } else if (userPrompt && /translate|hindi|convert|change the text|translate to|translate into/i.test(userPrompt)) {
+            finalPrompt = textToEnhance ? `${userPrompt}\n\nSource text:\n${textToEnhance}` : userPrompt;
+        } else if (userPrompt) {
+            finalPrompt = textToEnhance ? `${userPrompt}\n\nSource text:\n${textToEnhance}` : userPrompt;
+        } else {
+            // fallback default behavior
+            finalPrompt = `Fix any grammatical errors and improve this text to be more professional, but keep it concise and only give option one: ${textToEnhance}`;
+        }
+
+        console.log('%c🤖 Calling Gemini API with finalPrompt (enhance button):', 'color: #8D6E63', `"${finalPrompt}"`);
+        const enhancedText = await enhanceTextWithGemini(finalPrompt + SINGLE_OUTPUT_SUFFIX, true);
         
         if (enhancedText) {
             isApiUpdate = true; // Set flag before setting text
@@ -592,5 +638,122 @@ popup.addEventListener('click', async function(e) {
     }
 });
 
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (!message || message.type !== "PROMPT_FROM_POPUP") return;
+
+    const prompt = typeof message.prompt === "string" ? message.prompt : String(message.prompt || "");
+    console.log("[content.js] Received PROMPT_FROM_POPUP:", prompt, "from", sender);
+
+    // Persist the latest prompt globally so all tabs share it
+    try { chrome?.storage?.sync?.set({ savedPrompt: prompt }); } catch {}
+    window.__lastPopupPrompt = prompt;
+
+    (async () => {
+        try {
+            // If an enhancer exists, use it
+            if (typeof enhanceTextWithGemini === "function") {
+                /* Build finalPrompt from user popup input and available page text */
+                let enhanced = null;
+                try {
+                    const userInput = (typeof prompt === 'string') ? prompt.trim() : String(prompt || '');
+                    // Determine source text: prefer lastActiveInput content, fall back to stored window.__lastPopupPrompt or textToEnhance
+                    let sourceText = '';
+                    if (typeof lastActiveInput !== 'undefined' && lastActiveInput) {
+                        try { sourceText = getInputText(lastActiveInput); } catch (e) { sourceText = ''; }
+                    }
+                    if (!sourceText && typeof window.__lastPopupPrompt === 'string') sourceText = window.__lastPopupPrompt;
+                    if (!sourceText && typeof textToEnhance === 'string') sourceText = textToEnhance;
+
+                    // Build finalPrompt with heuristics
+                    let finalPrompt = '';
+                    if (userInput.includes('{text}')) {
+                        finalPrompt = userInput.replaceAll('{text}', sourceText || '');
+                    } else if (/translate|hindi|convert|change the text|translate to|translate into/i.test(userInput)) {
+                        // If user asked to translate or change language, append source text for context
+                        if (sourceText) {
+                            finalPrompt = `${userInput}\n\nSource text:\n${sourceText}`;
+                        } else {
+                            finalPrompt = userInput; // no source text available
+                        }
+                    } else if (userInput.length > 0) {
+                        // Generic instruction: append source text if available
+                        if (sourceText) {
+                            finalPrompt = `${userInput}\n\nSource text:\n${sourceText}`;
+                        } else {
+                            finalPrompt = userInput;
+                        }
+                    } else {
+                        // Fallback to default grammar-fix instruction using sourceText
+                        finalPrompt = `Fix any grammatical errors and improve this text to be more professional, but keep it concise and only give option one: ${sourceText}`;
+                    }
+
+                    console.log('[content.js] Final prompt constructed from popup input and page text:', finalPrompt);
+                    enhanced = await enhanceTextWithGemini(finalPrompt + SINGLE_OUTPUT_SUFFIX, true);
+                } catch (e) {
+                    console.error('[content.js] Error while building finalPrompt:', e);
+                    enhanced = await enhanceTextWithGemini(prompt + SINGLE_OUTPUT_SUFFIX, true);
+                }
+                console.log("[content.js] Enhanced prompt:", enhanced);
+
+                if (typeof lastActiveInput !== "undefined" && lastActiveInput && (typeof isValidInput !== "function" || isValidInput(lastActiveInput))) {
+                    // Use your helper if available
+                    if (typeof setInputText === "function") {
+                        await setInputText(lastActiveInput, enhanced || prompt);
+                    } else {
+                        if (lastActiveInput.isContentEditable) {
+                            lastActiveInput.innerText = enhanced || prompt;
+                            lastActiveInput.dispatchEvent(new Event("input", { bubbles: true }));
+                        } else {
+                            lastActiveInput.value = enhanced || prompt;
+                            lastActiveInput.dispatchEvent(new Event("input", { bubbles: true }));
+                        }
+                    }
+                    if (typeof placeCursorAtEnd === "function") placeCursorAtEnd(lastActiveInput);
+                    lastEnhancedText = enhanced || prompt;
+                    sendResponse({ success: true, injected: true, enhanced: !!enhanced });
+                    return;
+                }
+
+                // no focused input — store for later
+                window.__lastPopupPrompt = enhanced || prompt;
+                lastEnhancedText = enhanced || prompt;
+                sendResponse({ success: true, injected: false, enhanced: !!enhanced });
+                return;
+            }
+
+            // No enhancer — inject raw prompt into the currently focused element if possible
+            const active = document.activeElement;
+            if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)) {
+                if (active.isContentEditable) {
+                    active.innerText = prompt;
+                    const range = document.createRange();
+                    range.selectNodeContents(active);
+                    range.collapse(false);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                } else {
+                    active.value = prompt;
+                    active.dispatchEvent(new Event("input", { bubbles: true }));
+                }
+                sendResponse({ success: true, injected: true, enhanced: false });
+                return;
+            }
+
+            // fallback: save prompt for later
+            window.__lastPopupPrompt = prompt;
+            sendResponse({ success: true, injected: false, enhanced: false });
+        } catch (err) {
+            console.error("[content.js] Error processing prompt:", err);
+            sendResponse({ success: false, error: err && err.message ? err.message : String(err) });
+        }
+    })();
+
+    return true;
+});
+// ------------------ end insert ------------------
+
+
 // Initial check for models (optional, can be removed once confident)
-// checkAvailableModels(); 
+// checkAvailableModels();

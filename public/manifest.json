@@ -5,7 +5,9 @@
   "description": "A Chrome extension to enhance web pages using Gemini AI",
   "permissions": [
     "activeTab",
-    "storage"
+    "tabs",
+    "storage",
+    "scripting"
   ],
   "host_permissions": [
     "https://generativelanguage.googleapis.com/*"
