@@ -12,17 +12,206 @@ let lastEnhancedText = '';
 let textToEnhance = '';
 
 // Enforce single concise output from the model
-const SINGLE_OUTPUT_SUFFIX = "\n\nConstraints: Respond with exactly one final rewrite/translation only. Do not include multiple options, bullets, quotes, examples, or explanations.";
+const SINGLE_OUTPUT_SUFFIX = "\n\nConstraints: Respond with exactly one final rewrite/translation only. Do not include multiple options, bullets, quotes, examples, or explanations. Do not repeat or include the original/source text. Output only the final rewritten/translated sentence.";
 
-// Load saved prompt at startup for cross-tab persistence
-try {
-    chrome?.storage?.sync?.get({ savedPrompt: '' }, (res) => {
-        if (typeof res?.savedPrompt === 'string') {
-            window.__lastPopupPrompt = res.savedPrompt;
-            console.log('[content.js] Loaded savedPrompt from storage:', window.__lastPopupPrompt);
+// --- Add these helpers near the top of content.js ---
+
+function escapeHtml(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+/**
+ * Try to find a Lexical editor instance on or near the element.
+ * Looks for common property names on the element or its ancestors,
+ * and as a last resort scans window for objects that look like editors.
+ */
+function findLexicalEditorInstance(el) {
+  console.log('🔧 Step 2 - Looking for Lexical editor...');
+  if (!el) return null;
+  const props = [
+    '__lexicalEditor', '_lexicalEditor', 'lexicalEditor',
+    '_editor', '__editor', 'editor'
+  ];
+  let cur = el;
+  while (cur) {
+    for (const p of props) {
+      try {
+        if (cur[p] && typeof cur[p] === 'object') {
+          console.log(`🔧 Step 2 - Found editor via property: ${p}`);
+          return cur[p];
+        }
+      } catch (e) {}
+    }
+    cur = cur.parentElement;
+  }
+
+  // Last-resort: try to find a global-looking lexical/editor object on window
+  try {
+    const names = Object.getOwnPropertyNames(window);
+    for (const name of names) {
+      if (!name) continue;
+      try {
+        const v = window[name];
+        if (v && typeof v === 'object' && typeof v.update === 'function') {
+          const keyLower = String(name).toLowerCase();
+          if (keyLower.includes('lexical') || keyLower.includes('editor')) {
+            console.log(`🔧 Step 2 - Found editor on window: ${name}`);
+            return v;
+          }
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+
+  console.log('🔧 Step 2 - No Lexical editor instance found.');
+  return null;
+}
+
+/**
+ * Try to update Lexical editor using page-global helper functions if available,
+ * or using a generic editor.update() call. Returns true if successful.
+ */
+async function tryApplyLexicalEditor(lexicalEditor, text) {
+  if (!lexicalEditor || typeof lexicalEditor.update !== 'function') {
+    console.log('🔧 No usable editor.update() found on instance.');
+    return false;
+  }
+
+  // If page exported $getRoot / $createParagraphNode / $createTextNode (rare but possible),
+  // prefer that because it uses the actual Lexical helpers the page loaded.
+  const hasPageHelpers =
+    typeof window.$getRoot === 'function' &&
+    typeof window.$createParagraphNode === 'function' &&
+    typeof window.$createTextNode === 'function';
+
+  if (hasPageHelpers) {
+    try {
+      console.log('🔧 Step 3 - Using page-exposed Lexical helpers to update editor state.');
+      lexicalEditor.update(() => {
+        const root = window.$getRoot();
+        root.clear();
+        const p = window.$createParagraphNode();
+        p.append(window.$createTextNode(text));
+        root.append(p);
+      });
+      return true;
+    } catch (err) {
+      console.error('🔧 Lexical helper path failed:', err);
+      // fallthrough to other attempts
+    }
+  }
+
+  // Generic editor.update() attempt: try to insert text via known instance methods or by touching the root element.
+  try {
+    console.log('🔧 Step 3 - Attempting generic editor.update insertion...');
+    let success = false;
+    lexicalEditor.update(() => {
+      try {
+        // many times editor.insertText won't exist here, but try defensive checks
+        if (typeof lexicalEditor.insertText === 'function') {
+          lexicalEditor.insertText(text);
+          success = true;
+          return;
+        }
+
+        // some editors expose getRootElement or similar - try to use it
+        if (typeof lexicalEditor.getRootElement === 'function') {
+          const rootEl = lexicalEditor.getRootElement();
+          if (rootEl && rootEl.nodeType === Node.ELEMENT_NODE) {
+            while (rootEl.firstChild) rootEl.removeChild(rootEl.firstChild);
+            const p = document.createElement('p');
+            p.textContent = text;
+            rootEl.appendChild(p);
+            success = true;
+            return;
+          }
+        }
+
+        // If nothing else, throw to fallback to paste/dom approach
+        throw new Error('No safe insertion method found in generic editor.update()');
+      } catch (err) {
+        console.warn('🔧 inside lexicalEditor.update: fallback hit', err);
+        throw err;
+      }
+    });
+    return !!success;
+  } catch (err) {
+    console.warn('🔧 Generic lexicalEditor.update path failed:', err);
+    return false;
+  }
+}
+
+// Enhanced cross-tab prompt synchronization
+// Add this at the top of your content.js file, replacing the existing storage code
+
+let globalPrompt = '';
+
+// Load saved prompt at startup with better error handling
+async function loadSavedPrompt() {
+    try {
+        if (chrome?.storage?.sync) {
+            return new Promise((resolve) => {
+                chrome.storage.sync.get({ savedPrompt: '' }, (res) => {
+                    if (chrome.runtime.lastError) {
+                        console.error('Error loading saved prompt:', chrome.runtime.lastError);
+                        resolve('');
+                    } else {
+                        const prompt = typeof res?.savedPrompt === 'string' ? res.savedPrompt : '';
+                        globalPrompt = prompt;
+                        window.__lastPopupPrompt = prompt;
+                        console.log('[content.js] Loaded savedPrompt from storage:', prompt);
+                        resolve(prompt);
+                    }
+                });
+            });
+        }
+    } catch (e) {
+        console.error('Error accessing Chrome storage:', e);
+    }
+    return '';
+}
+
+// Save prompt with better error handling
+async function savePrompt(prompt) {
+    try {
+        if (chrome?.storage?.sync) {
+            return new Promise((resolve) => {
+                chrome.storage.sync.set({ savedPrompt: prompt }, () => {
+                    if (chrome.runtime.lastError) {
+                        console.error('Error saving prompt:', chrome.runtime.lastError);
+                        resolve(false);
+                    } else {
+                        console.log('[content.js] Saved prompt to storage:', prompt);
+                        resolve(true);
+                    }
+                });
+            });
+        }
+    } catch (e) {
+        console.error('Error saving to Chrome storage:', e);
+    }
+    return false;
+}
+
+// Listen for storage changes from other tabs
+if (chrome?.storage?.onChanged) {
+    chrome.storage.onChanged.addListener((changes, namespace) => {
+        if (namespace === 'sync' && changes.savedPrompt) {
+            const newPrompt = changes.savedPrompt.newValue || '';
+            console.log('[content.js] Storage changed from another tab:', newPrompt);
+            globalPrompt = newPrompt;
+            window.__lastPopupPrompt = newPrompt;
         }
     });
-} catch {}
+}
+
+// Initialize on script load
+loadSavedPrompt();
 
 // Quick heartbeat for popup to detect content script presence
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -116,6 +305,7 @@ const findClosestContentEditable = (element) => {
 };
 
 // Function to get text from an input element
+// Enhanced getInputText to better handle WhatsApp structures
 const getInputText = (element) => {
     console.log('%c🔍 getInputText called for:', 'color: #2196F3', element);
     
@@ -124,113 +314,436 @@ const getInputText = (element) => {
         return '';
     }
 
+    // Handle standard input elements
     if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
-        console.log('%cInput/Textarea value:', 'color: #2196F3', element.value);
-        return element.value;
+        return element.value || '';
     }
     
-    const contentEditableElement = findClosestContentEditable(element);
-    if (contentEditableElement) {
-        console.log('%cContentEditable element found:', 'color: #2196F3', contentEditableElement);
-        
-        const textSpan = contentEditableElement.querySelector('.selectable-text.copyable-text[data-lexical-text="true"]');
-        if (textSpan) {
-            console.log('%cText span content:', 'color: #2196F3', textSpan.textContent);
-            return textSpan.textContent;
+    // Handle contenteditable elements
+    if (element.isContentEditable) {
+        // For WhatsApp, get text from all text spans to handle the concatenation issue
+        const allTextSpans = element.querySelectorAll('[data-lexical-text="true"]');
+        if (allTextSpans.length > 0) {
+            const combinedText = Array.from(allTextSpans)
+                .map(span => span.textContent || '')
+                .join('');
+            console.log('%cCombined text from spans:', 'color: #2196F3', `"${combinedText}"`);
+            return combinedText;
         }
         
-        console.log('%cContentEditable textContent:', 'color: #2196F3', contentEditableElement.textContent);
-        return contentEditableElement.textContent;
+        // Fallback to textContent
+        return element.textContent || '';
     }
-    console.log('%cNo text found for element.', 'color: #F44336');
+    
     return '';
 };
 
-// Function to set text in an input element
+
+// WhatsApp/Lexical-safe setter for contenteditable inputs
+                        // async function setEditableText(editableElement, text) {
+//     if (!editableElement) return;
+
+//     console.log('%c🔧 setEditableText called with text:', 'color: #FF5722', text);
+//     console.log('%c🔧 Target element:', 'color: #FF5722', editableElement);
+
+//     // Target the Lexical root if available
+//     const root = editableElement.closest('div[contenteditable="true"][data-lexical-editor="true"]') || editableElement;
+//     root.focus();
+    
+//     console.log('%c🔧 Root element:', 'color: #FF5722', root);
+
+//     let updated = false;
+
+//     // 1) Deterministic DOM replace: single paragraph + lexical span with only enhanced text
+//     try {
+//         while (root.firstChild) root.removeChild(root.firstChild);
+//         const p = document.createElement('p');
+//         p.className = 'selectable-text copyable-text';
+//         const s = document.createElement('span');
+//         s.setAttribute('data-lexical-text', 'true');
+//         s.textContent = text;
+//         p.appendChild(s);
+//         root.appendChild(p);
+//         updated = true;
+//         console.log('%c🔧 DOM manipulation successful', 'color: #4CAF50');
+//     } catch (e) { 
+//         console.log('%c🔧 DOM manipulation failed:', 'color: #F44336', e);
+//         updated = false; 
+//     }
+
+//     // 2) If DOM replace somehow blocked, try Range-based replace
+//     if (!updated) {
+//         try {
+//             const sel = window.getSelection();
+//             const r = document.createRange();
+//             r.selectNodeContents(root);
+//             sel.removeAllRanges();
+//             sel.addRange(r);
+//             r.deleteContents();
+//             const node = document.createTextNode(text);
+//             r.insertNode(node);
+//             sel.removeAllRanges();
+//             const end = document.createRange();
+//             end.selectNodeContents(root);
+//             end.collapse(false);
+//             sel.addRange(end);
+//             updated = true;
+//         } catch { updated = false; }
+//     }
+
+//     // 3) Clipboard paste path (Lexical-friendly)
+//     if (!updated) {
+//         try {
+//             const sel = window.getSelection();
+//             const r = document.createRange();
+//             r.selectNodeContents(root);
+//             sel.removeAllRanges();
+//             sel.addRange(r);
+//             const dt = new DataTransfer();
+//             dt.setData('text/plain', text);
+//             const pasteEvent = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
+//             updated = root.dispatchEvent(pasteEvent) === true;
+//         } catch { updated = false; }
+//     }
+
+//     // 4) ExecCommand delete + insertText
+//     if (!updated) {
+//         try {
+//             const sel = window.getSelection();
+//             const r = document.createRange();
+//             r.selectNodeContents(root);
+//             sel.removeAllRanges();
+//             sel.addRange(r);
+//             try { document.execCommand && document.execCommand('delete'); } catch {}
+//             try { updated = !!(document.execCommand && document.execCommand('insertText', false, text)); } catch { updated = false; }
+//         } catch { updated = false; }
+//     }
+
+//     // 5) Final normalization (ensure only enhanced text remains)
+//     try {
+//         const paras = Array.from(root.querySelectorAll('p'));
+//         const first = paras[0] || document.createElement('p');
+//         if (!first.parentElement) root.appendChild(first);
+//         first.classList.add('selectable-text', 'copyable-text');
+//         for (let i = 1; i < paras.length; i++) paras[i].remove();
+//         while (first.firstChild) first.removeChild(first.firstChild);
+//         const s = document.createElement('span');
+//         s.setAttribute('data-lexical-text', 'true');
+//         s.textContent = text;
+//         first.appendChild(s);
+//     } catch {}
+
+//     // Verify the text was actually set
+//     const finalText = root.textContent || root.innerText || '';
+//     console.log('%c🔧 Final text in element:', 'color: #FF5722', `"${finalText}"`);
+//     console.log('%c🔧 Expected text:', 'color: #FF5722', `"${text}"`);
+//     console.log('%c🔧 Text matches:', 'color: #FF5722', finalText === text);
+    
+//     // Dispatch input/change to notify frameworks
+//     try { root.dispatchEvent(new InputEvent('input', { bubbles: true })); } catch {}
+//     try { root.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+                        // }
+
+// --- Replace your old setInputText with this complete async function ---
+// Improved setInputText function specifically for WhatsApp Web
+// Fixed setInputText function - properly clears and replaces text
+// Enhanced setInputText function with better WhatsApp Web support
 async function setInputText(element, text) {
-    console.log('%c✍️ Setting text for element:', 'color: #2196F3', element, 'with text:', text);
+    if (!element) return;
     
-    if (!element) {
-        console.log('No element provided to setInputText');
-        return;
-    }
+    console.log('%c🔧 setInputText called with text:', 'color: #FF5722', text);
+    console.log('%c🔧 Target element:', 'color: #FF5722', element);
 
-    const isContentEditable = element.getAttribute('contenteditable') === 'true';
-    const isTextarea = element.tagName === 'TEXTAREA';
-    const isInput = element.tagName === 'INPUT';
-    const isWhatsApp = window.location.hostname.includes('web.whatsapp.com');
-    
-    console.log('Element type:', {
-        isContentEditable,
-        isTextarea,
-        isInput,
-        isWhatsApp,
-        tagName: element.tagName
-    });
+    element.focus();
+    isApiUpdate = true;
 
-    if (isContentEditable) {
-        const contentEditableElement = element;
-        const observerWasConnected = currentObserver && currentObserver.isConnected;
-        
-        if (observerWasConnected) {
-            console.log('Disconnecting observer before setting text');
-            currentObserver.disconnect();
-        }
-        
-        isApiUpdate = true; // Set this flag BEFORE modifying the DOM
-        console.log('%c🚩 isApiUpdate set to TRUE in setInputText (before DOM mod).', 'color: #FFC107', `Time: ${performance.now().toFixed(2)}ms`);
-        
-        try {
-            if (isWhatsApp) {
-                // For WhatsApp Web, use the specialized function
-                await setEditableText(contentEditableElement, text);
-            } else {
-                // For other contenteditable elements
-                contentEditableElement.textContent = text;
-                contentEditableElement.dispatchEvent(new Event('input', { bubbles: true }));
-            }
-            
-            // Reset isApiUpdate after a delay
-            setTimeout(() => {
-                isApiUpdate = false;
-                console.log('%c🚩 isApiUpdate set to FALSE (after delay).', 'color: #FFC107', `Time: ${performance.now().toFixed(2)}ms`);
-                // Also reset lastProcessedText to allow new changes to trigger popup
-                lastProcessedText = text;
-                console.log('%c[MutationObserver] lastProcessedText reset to:', 'color: #FFC107', `"${lastProcessedText}"`);
-            }, 300); // Increased delay slightly to 300ms
-            
-            if (contentEditableElement && observerWasConnected) { // Reconnect only if it was disconnected
-                console.log('Reconnecting observer after setting text');
-                setupMutationObserver(contentEditableElement);
-            }
-        } catch (error) {
-            console.error('Error setting contenteditable text:', error);
-            isApiUpdate = false; // Reset flag on error
-        }
-    } else if (isTextarea || isInput) {
-        isApiUpdate = true; // Set this flag BEFORE modifying the DOM
-        console.log('%c🚩 isApiUpdate set to TRUE in setInputText (before DOM mod).', 'color: #FFC107', `Time: ${performance.now().toFixed(2)}ms`);
-        
+    // Handle regular input/textarea elements
+    if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
         try {
             element.value = text;
             element.dispatchEvent(new Event('input', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+            element.setSelectionRange(text.length, text.length);
             
-            // Reset isApiUpdate after a delay
-            setTimeout(() => {
-                isApiUpdate = false;
-                console.log('%c🚩 isApiUpdate set to FALSE (after delay).', 'color: #FFC107', `Time: ${performance.now().toFixed(2)}ms`);
-                // Also reset lastProcessedText to allow new changes to trigger popup
-                lastProcessedText = text;
-                console.log('%c[MutationObserver] lastProcessedText reset to:', 'color: #FFC107', `"${lastProcessedText}"`);
-            }, 300); // Increased delay slightly to 300ms
-        } catch (error) {
-            console.error('Error setting input/textarea value:', error);
-            isApiUpdate = false; // Reset flag on error
+            console.log('%c🔧 Standard input/textarea updated successfully', 'color: #4CAF50');
+            lastEnhancedText = text;
+            lastProcessedText = text;
+            isApiUpdate = false;
+            return;
+        } catch (e) {
+            console.log('%c🔧 Standard input method failed:', 'color: #F44336', e);
+        }
+    }
+
+    // Handle contenteditable elements (WhatsApp, Gmail, etc.)
+    const root = element.closest('div[contenteditable="true"]') || element;
+    let success = false;
+
+    // Method 1: Aggressive clearing with multiple attempts
+    try {
+        console.log('%c🔧 Method 1: Aggressive clearing and replacement', 'color: #2196F3');
+        
+        root.focus();
+        
+        // Step 1: Multiple clearing attempts
+        for (let attempt = 0; attempt < 3; attempt++) {
+            console.log(`%c🔧 Clearing attempt ${attempt + 1}`, 'color: #FF9800');
+            
+            // Clear via selection and deletion
+            try {
+                const selection = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(root);
+                selection.removeAllRanges();
+                selection.addRange(range);
+                
+                // Multiple deletion methods
+                range.deleteContents();
+                document.execCommand('delete');
+                document.execCommand('cut');
+                
+                selection.removeAllRanges();
+            } catch (e) {
+                console.log(`Clear attempt ${attempt + 1} failed:`, e);
+            }
+            
+            // Direct DOM clearing
+            try {
+                root.innerHTML = '';
+                root.textContent = '';
+                while (root.firstChild) {
+                    root.removeChild(root.firstChild);
+                }
+            } catch (e) {
+                console.log(`DOM clear attempt ${attempt + 1} failed:`, e);
+            }
+            
+            // Check if cleared
+            const currentText = root.textContent || root.innerText || '';
+            console.log(`%c🔧 After clear attempt ${attempt + 1}, remaining text:`, 'color: #FF9800', `"${currentText}"`);
+            
+            if (!currentText.trim()) {
+                console.log('%c🔧 Successfully cleared content', 'color: #4CAF50');
+                break;
+            }
+            
+            // Small delay between attempts
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        
+        // Step 2: Insert new text with proper structure
+        if (root.dataset.lexicalEditor === 'true') {
+            // WhatsApp Lexical structure
+            const paragraph = document.createElement('p');
+            paragraph.className = 'selectable-text copyable-text';
+            
+            const textSpan = document.createElement('span');
+            textSpan.setAttribute('data-lexical-text', 'true');
+            textSpan.textContent = text;
+            
+            paragraph.appendChild(textSpan);
+            root.appendChild(paragraph);
+        } else {
+            // Generic contenteditable
+            root.textContent = text;
+        }
+        
+        success = true;
+        console.log('%c🔧 Method 1: SUCCESS', 'color: #4CAF50');
+    } catch (e) {
+        console.log('%c🔧 Method 1 failed:', 'color: #F44336', e);
+    }
+
+    // Method 2: Keyboard simulation approach
+    if (!success) {
+        try {
+            console.log('%c🔧 Method 2: Keyboard simulation', 'color: #2196F3');
+            
+            root.focus();
+            
+            // Simulate Ctrl+A to select all
+            root.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'a',
+                code: 'KeyA',
+                ctrlKey: true,
+                bubbles: true
+            }));
+            
+            await new Promise(resolve => setTimeout(resolve, 50));
+            
+            // Simulate typing the new text
+            for (const char of text) {
+                root.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: char,
+                    code: `Key${char.toUpperCase()}`,
+                    bubbles: true
+                }));
+                
+                root.dispatchEvent(new InputEvent('input', {
+                    data: char,
+                    inputType: 'insertText',
+                    bubbles: true
+                }));
+            }
+            
+            success = true;
+            console.log('%c🔧 Method 2: SUCCESS', 'color: #4CAF50');
+        } catch (e) {
+            console.log('%c🔧 Method 2 failed:', 'color: #F44336', e);
+        }
+    }
+
+    // Method 3: Force replacement with innerHTML
+    if (!success) {
+        try {
+            console.log('%c🔧 Method 3: Force innerHTML replacement', 'color: #2196F3');
+            
+            const escapedText = text.replace(/&/g, '&amp;')
+                                  .replace(/</g, '&lt;')
+                                  .replace(/>/g, '&gt;')
+                                  .replace(/"/g, '&quot;')
+                                  .replace(/'/g, '&#039;');
+            
+            if (root.dataset.lexicalEditor === 'true') {
+                root.innerHTML = `<p class="selectable-text copyable-text"><span data-lexical-text="true">${escapedText}</span></p>`;
+            } else {
+                root.innerHTML = escapedText;
+            }
+            
+            success = true;
+            console.log('%c🔧 Method 3: SUCCESS', 'color: #4CAF50');
+        } catch (e) {
+            console.log('%c🔧 Method 3 failed:', 'color: #F44336', e);
+        }
+    }
+
+    // Method 4: Lexical editor specific approach
+    if (!success && root.dataset.lexicalEditor === 'true') {
+        try {
+            console.log('%c🔧 Method 4: Lexical editor specific approach', 'color: #2196F3');
+            
+            // Try to find and use Lexical editor instance
+            const lexicalEditor = findLexicalEditorInstance(root);
+            if (lexicalEditor) {
+                const lexicalSuccess = await tryApplyLexicalEditor(lexicalEditor, text);
+                if (lexicalSuccess) {
+                    success = true;
+                    console.log('%c🔧 Method 4: SUCCESS via Lexical editor', 'color: #4CAF50');
+                }
+            }
+        } catch (e) {
+            console.log('%c🔧 Method 4 failed:', 'color: #F44336', e);
+        }
+    }
+
+    // Position cursor at end
+    try {
+        const range = document.createRange();
+        const selection = window.getSelection();
+        range.selectNodeContents(root);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+    } catch (e) {
+        console.log('%c🔧 Cursor positioning failed:', 'color: #FFC107', e);
+    }
+
+    // Dispatch events
+    const events = [
+        new Event('input', { bubbles: true }),
+        new Event('change', { bubbles: true }),
+        new KeyboardEvent('keyup', { bubbles: true })
+    ];
+
+    events.forEach(event => {
+        try {
+            root.dispatchEvent(event);
+        } catch (e) {
+            console.log('%c🔧 Event dispatch failed:', 'color: #FFC107', e);
+        }
+    });
+
+    // Update tracking variables
+    lastEnhancedText = text;
+    lastProcessedText = text;
+
+    // Enhanced verification with retry
+    setTimeout(async () => {
+        let finalText = getInputText(root);
+        console.log('%c🔧 Final verification - Expected:', 'color: #2196F3', `"${text}"`);
+        console.log('%c🔧 Final verification - Actual:', 'color: #2196F3', `"${finalText}"`);
+        
+        // If text still contains original text, try one more aggressive clear
+        if (finalText.includes('hi i is shivam') || finalText !== text) {
+            console.log('%c🔧 Verification failed, attempting final cleanup', 'color: #FF9800');
+            
+            try {
+                // Nuclear option: completely rebuild the element structure
+                const parent = root.parentElement;
+                const newRoot = root.cloneNode(false); // Clone without children
+                
+                if (root.dataset.lexicalEditor === 'true') {
+                    const p = document.createElement('p');
+                    p.className = 'selectable-text copyable-text';
+                    const span = document.createElement('span');
+                    span.setAttribute('data-lexical-text', 'true');
+                    span.textContent = text;
+                    p.appendChild(span);
+                    newRoot.appendChild(p);
+                } else {
+                    newRoot.textContent = text;
+                }
+                
+                parent.replaceChild(newRoot, root);
+                newRoot.focus();
+                
+                // Update reference if this is the active input
+                if (lastActiveInput === root) {
+                    lastActiveInput = newRoot;
+                }
+                
+                console.log('%c🔧 Final cleanup completed', 'color: #4CAF50');
+            } catch (e) {
+                console.log('%c🔧 Final cleanup failed:', 'color: #F44336', e);
+            }
+        }
+        
+        isApiUpdate = false;
+    }, 200);
+}
+
+// Alternative approach: Try to trigger WhatsApp's internal text setting mechanism
+async function setWhatsAppText(element, text) {
+    // This function attempts to work with WhatsApp's internal React/Lexical state
+    element.focus();
+    
+    // Try to find React fiber node
+    const fiberKey = Object.keys(element).find(key => key.startsWith('__reactInternalInstance') || key.startsWith('_reactInternalFiber'));
+    
+    if (fiberKey) {
+        try {
+            const fiber = element[fiberKey];
+            // This is experimental - React Fiber manipulation
+            console.log('%c🔧 Found React Fiber:', 'color: #9C27B0', fiber);
+            
+            // Try to trigger React's onChange
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+            const event = new Event('input', { bubbles: true });
+            
+            element.focus();
+            element.select();
+            document.execCommand('insertText', false, text);
+            element.dispatchEvent(event);
+        } catch (e) {
+            console.log('%c🔧 React Fiber approach failed:', 'color: #F44336', e);
+            // Fallback to regular method
+            return setInputText(element, text);
         }
     } else {
-        console.log('Element is not a valid input type:', element.tagName);
+        return setInputText(element, text);
     }
 }
+  
 
 // Function to setup MutationObserver
 const setupMutationObserver = (element) => {
@@ -444,20 +957,106 @@ function createPopup() {
 
 const popup = createPopup();
 
+// Updated enhance button click handler - use the globally synced prompt
+// Replace your existing btn.addEventListener('click', ...) with this:
+function createEnhanceButtonHandler(btn) {
+    return async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        
+        if (!lastActiveInput || !textToEnhance) {
+            console.warn('No active input or no text to enhance.');
+            return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = 'Enhancing...';
+
+        const globalEnterBlocker = (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                return false;
+            }
+        };
+        
+        document.addEventListener('keydown', globalEnterBlocker, true);
+        document.addEventListener('keyup', globalEnterBlocker, true);
+
+        try {
+            // Always get the latest prompt from storage to ensure cross-tab sync
+            let userPrompt = await loadSavedPrompt();
+            
+            // Fallback to global or window variable if storage fails
+            if (!userPrompt) {
+                userPrompt = globalPrompt || window.__lastPopupPrompt || '';
+            }
+
+            console.log('[content.js] Using prompt for enhancement:', userPrompt);
+
+            let finalPrompt = '';
+            if (userPrompt && userPrompt.includes('{text}')) {
+                finalPrompt = userPrompt.replaceAll('{text}', textToEnhance);
+            } else if (userPrompt && /translate|hindi|convert|change the text|translate to|translate into/i.test(userPrompt)) {
+                finalPrompt = textToEnhance ? `${userPrompt}\n\nSource text:\n${textToEnhance}` : userPrompt;
+            } else if (userPrompt) {
+                finalPrompt = textToEnhance ? `${userPrompt}\n\nSource text:\n${textToEnhance}` : userPrompt;
+            } else {
+                finalPrompt = `Fix any grammatical errors and improve this text to be more professional, but keep it concise and only give option one: ${textToEnhance}`;
+            }
+
+            console.log('%c🤖 Calling Gemini API with finalPrompt (enhance button):', 'color: #8D6E63', `${finalPrompt}`);
+            const enhancedText = await enhanceTextWithGemini(finalPrompt + SINGLE_OUTPUT_SUFFIX, true);
+            
+            if (enhancedText) {
+                console.log('✨ Enhanced text received:', enhancedText);
+                await setInputText(lastActiveInput, enhancedText);
+                placeCursorAtEnd(lastActiveInput);
+                lastEnhancedText = enhancedText;
+                console.log('%clastEnhancedText updated to:', 'color: #FFC107', `${lastEnhancedText}`, 'Time:', performance.now().toFixed(2) + 'ms');
+            } else {
+                console.error('Failed to get enhanced text from API');
+            }
+        } catch (error) {
+            console.error('Error during text enhancement:', error);
+        }
+
+        setTimeout(() => {
+            document.removeEventListener('keydown', globalEnterBlocker, true);
+            document.removeEventListener('keyup', globalEnterBlocker, true);
+        }, 1500);
+
+        btn.disabled = false;
+        btn.textContent = 'Enhance';
+        resetPopup();
+    };
+}
+
 // Reset popup state
 function resetPopup() {
-    popup.innerHTML = '<button>Enhance</button>';
+    popup.innerHTML = '';
+    const btn = document.createElement('button');
+    btn.textContent = 'Enhance';
+    btn.style.cssText = `
+        padding: 6px 12px;
+        border-radius: 6px;
+        border: none;
+        background: #4CAF50;
+        color: white;
+        cursor: pointer;
+        font-size: 14px;
+    `;
+    
+    // Updated: use cross-tab synced handler
+    btn.addEventListener('click', createEnhanceButtonHandler(btn));
+    
+    popup.appendChild(btn);
     popup.style.opacity = '0';
     popup.style.display = 'none';
-    if (timeoutId) {
-        clearTimeout(timeoutId);
-        timeoutId = null;
-    }
-    if (textChangeTimeout) {
-        clearTimeout(textChangeTimeout);
-        textChangeTimeout = null;
-    }
+    if (timeoutId) clearTimeout(timeoutId);
+    if (textChangeTimeout) clearTimeout(textChangeTimeout);
 }
+
 
 // Call Gemini API
 async function callGeminiAPI(text, hideAlert = false) {
@@ -547,157 +1146,84 @@ document.addEventListener('input', function(e) {
     }
 });
 
-popup.addEventListener('click', async function(e) {
-    e.stopPropagation();
-    
-    if (isProcessing) {
-        return;
-    }
-    
-    // Ensure lastActiveInput is valid before proceeding
-    if (!lastActiveInput || !isValidInput(lastActiveInput)) {
-        popup.style.display = 'none';
-        resetPopup();
-        alert('Please click on an input field and type some text first');
-        console.error('No valid lastActiveInput when enhance button clicked. lastActiveInput:', lastActiveInput);
-        return;
-    }
-
-    // Use textToEnhance which was captured when popup was shown
-    if (!textToEnhance.trim()) {
-        popup.style.display = 'none';
-        resetPopup();
-        alert('No text available to enhance.');
-        console.error('Attempted to enhance empty text from textToEnhance.');
-        return;
-    }
-
-    try {
-        isProcessing = true;
-
-        popup.innerHTML = '....';
-
-        // Build final prompt from saved/global prompt + current text
-        let userPrompt = typeof window.__lastPopupPrompt === 'string' ? window.__lastPopupPrompt : '';
-        try {
-            // Try to refresh from storage if empty
-            if (!userPrompt && chrome?.storage?.sync) {
-                await new Promise((resolve) => {
-                    chrome.storage.sync.get({ savedPrompt: '' }, (res) => {
-                        if (typeof res?.savedPrompt === 'string') {
-                            userPrompt = res.savedPrompt;
-                            window.__lastPopupPrompt = userPrompt;
-                        }
-                        resolve();
-                    });
-                });
-            }
-        } catch {}
-
-        let finalPrompt = '';
-        if (userPrompt && userPrompt.includes('{text}')) {
-            finalPrompt = userPrompt.replaceAll('{text}', textToEnhance);
-        } else if (userPrompt && /translate|hindi|convert|change the text|translate to|translate into/i.test(userPrompt)) {
-            finalPrompt = textToEnhance ? `${userPrompt}\n\nSource text:\n${textToEnhance}` : userPrompt;
-        } else if (userPrompt) {
-            finalPrompt = textToEnhance ? `${userPrompt}\n\nSource text:\n${textToEnhance}` : userPrompt;
-        } else {
-            // fallback default behavior
-            finalPrompt = `Fix any grammatical errors and improve this text to be more professional, but keep it concise and only give option one: ${textToEnhance}`;
-        }
-
-        console.log('%c🤖 Calling Gemini API with finalPrompt (enhance button):', 'color: #8D6E63', `"${finalPrompt}"`);
-        const enhancedText = await enhanceTextWithGemini(finalPrompt + SINGLE_OUTPUT_SUFFIX, true);
-        
-        if (enhancedText) {
-            isApiUpdate = true; // Set flag before setting text
-            console.log('%c🚩 isApiUpdate set to TRUE in popup click handler (before setInputText).', 'color: #FFC107', `Time: ${performance.now().toFixed(2)}ms`);
-            await setInputText(lastActiveInput, enhancedText);
-            placeCursorAtEnd(lastActiveInput);
-            lastActiveInput.dispatchEvent(new Event('input', { bubbles: true }));
-            lastActiveInput.dispatchEvent(new Event('change', { bubbles: true }));
-            // lastProcessedText is now updated inside setInputText automatically
-            lastEnhancedText = enhancedText; // Store the enhanced text
-            console.log('%clastEnhancedText updated to:', 'color: #FFC107', `"${lastEnhancedText}"`, `Time: ${performance.now().toFixed(2)}ms`);
-            popup.style.display = 'none';
-            resetPopup();
-        } else {
-            popup.innerHTML = 'Error: Could not enhance text';
-            setTimeout(resetPopup, 2000);
-        }
-    } catch (error) {
-        console.error('Error during text enhancement:', error);
-        popup.innerHTML = 'Error: ' + error.message;
-        setTimeout(resetPopup, 2000);
-    } finally {
-        isProcessing = false;
-        if (currentObserver) {
-            currentObserver.disconnect();
-            currentObserver = null;
-        }
-    }
-});
-
-
+// Updated message listener with better prompt synchronization
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message && message.type === 'PING') {
+        sendResponse({ ok: true });
+        return true;
+    }
+
     if (!message || message.type !== "PROMPT_FROM_POPUP") return;
 
     const prompt = typeof message.prompt === "string" ? message.prompt : String(message.prompt || "");
     console.log("[content.js] Received PROMPT_FROM_POPUP:", prompt, "from", sender);
 
-    // Persist the latest prompt globally so all tabs share it
-    try { chrome?.storage?.sync?.set({ savedPrompt: prompt }); } catch {}
-    window.__lastPopupPrompt = prompt;
-
     (async () => {
         try {
-            // If an enhancer exists, use it
+            // Save to storage first for cross-tab sync
+            await savePrompt(prompt);
+            
+            // Update local variables
+            globalPrompt = prompt;
+            window.__lastPopupPrompt = prompt;
+
+            // Broadcast to other tabs via storage (this will trigger storage change listeners)
+            // The storage.set above already handles this, but we can also send a direct message
+            try {
+                chrome.runtime.sendMessage({
+                    type: 'PROMPT_UPDATED',
+                    prompt: prompt
+                });
+            } catch (e) {
+                // Ignore if no other tabs are listening
+            }
+
             if (typeof enhanceTextWithGemini === "function") {
-                /* Build finalPrompt from user popup input and available page text */
                 let enhanced = null;
                 try {
-                    const userInput = (typeof prompt === 'string') ? prompt.trim() : String(prompt || '');
-                    // Determine source text: prefer lastActiveInput content, fall back to stored window.__lastPopupPrompt or textToEnhance
+                    const userInput = prompt.trim();
                     let sourceText = '';
+                    
                     if (typeof lastActiveInput !== 'undefined' && lastActiveInput) {
-                        try { sourceText = getInputText(lastActiveInput); } catch (e) { sourceText = ''; }
+                        try { 
+                            sourceText = getInputText(lastActiveInput); 
+                        } catch (e) { 
+                            sourceText = ''; 
+                        }
                     }
-                    if (!sourceText && typeof window.__lastPopupPrompt === 'string') sourceText = window.__lastPopupPrompt;
-                    if (!sourceText && typeof textToEnhance === 'string') sourceText = textToEnhance;
+                    if (!sourceText && typeof textToEnhance === 'string') {
+                        sourceText = textToEnhance;
+                    }
 
-                    // Build finalPrompt with heuristics
                     let finalPrompt = '';
                     if (userInput.includes('{text}')) {
                         finalPrompt = userInput.replaceAll('{text}', sourceText || '');
                     } else if (/translate|hindi|convert|change the text|translate to|translate into/i.test(userInput)) {
-                        // If user asked to translate or change language, append source text for context
                         if (sourceText) {
                             finalPrompt = `${userInput}\n\nSource text:\n${sourceText}`;
                         } else {
-                            finalPrompt = userInput; // no source text available
+                            finalPrompt = userInput;
                         }
                     } else if (userInput.length > 0) {
-                        // Generic instruction: append source text if available
                         if (sourceText) {
                             finalPrompt = `${userInput}\n\nSource text:\n${sourceText}`;
                         } else {
                             finalPrompt = userInput;
                         }
                     } else {
-                        // Fallback to default grammar-fix instruction using sourceText
                         finalPrompt = `Fix any grammatical errors and improve this text to be more professional, but keep it concise and only give option one: ${sourceText}`;
                     }
 
-                    console.log('[content.js] Final prompt constructed from popup input and page text:', finalPrompt);
+                    console.log('[content.js] Final prompt constructed:', finalPrompt);
                     enhanced = await enhanceTextWithGemini(finalPrompt + SINGLE_OUTPUT_SUFFIX, true);
                 } catch (e) {
                     console.error('[content.js] Error while building finalPrompt:', e);
                     enhanced = await enhanceTextWithGemini(prompt + SINGLE_OUTPUT_SUFFIX, true);
                 }
+
                 console.log("[content.js] Enhanced prompt:", enhanced);
 
                 if (typeof lastActiveInput !== "undefined" && lastActiveInput && (typeof isValidInput !== "function" || isValidInput(lastActiveInput))) {
-                    // Use your helper if available
                     if (typeof setInputText === "function") {
                         await setInputText(lastActiveInput, enhanced || prompt);
                     } else {
@@ -715,7 +1241,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     return;
                 }
 
-                // no focused input — store for later
+                // No focused input — store for later
+                globalPrompt = enhanced || prompt;
                 window.__lastPopupPrompt = enhanced || prompt;
                 lastEnhancedText = enhanced || prompt;
                 sendResponse({ success: true, injected: false, enhanced: !!enhanced });
@@ -741,7 +1268,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 return;
             }
 
-            // fallback: save prompt for later
+            // Fallback: save prompt for later
+            globalPrompt = prompt;
             window.__lastPopupPrompt = prompt;
             sendResponse({ success: true, injected: false, enhanced: false });
         } catch (err) {
@@ -752,8 +1280,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     return true;
 });
-// ------------------ end insert ------------------
 
+// Listen for prompt updates from other tabs
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message && message.type === 'PROMPT_UPDATED') {
+        console.log('[content.js] Received prompt update from another tab:', message.prompt);
+        globalPrompt = message.prompt;
+        window.__lastPopupPrompt = message.prompt;
+        sendResponse({ received: true });
+    }
+});
 
 // Initial check for models (optional, can be removed once confident)
 // checkAvailableModels();
