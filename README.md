@@ -50,28 +50,28 @@ IntelliText/
 
 
 
-## 🛠️ 1️⃣ Clone the Repository
+## 1 Clone the Repository
 
 ```
 git clone https://github.com/Shivamjawaliya/IntelliText.git
 cd IntelliText
 ```
 
- ## 2️⃣ Install Dependencies
+ ## 2 Install Dependencies
  ```
 npm install
 # or
 yarn install
 ```
-## 3️⃣ Run the Development Server
+## 3 Run the Development Server
 ```
 npm run dev
 ```
 
-## 4️⃣ Build for Production
+## 4 Build for Production
 ``` npm run build ```
 
-## 5️⃣ Load Extension in Chrome
+## 5 Load Extension in Chrome
 1. Open chrome://extensions/
 2. Turn on Developer mode
 3. Click Load unpacked
