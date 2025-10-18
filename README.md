@@ -6,13 +6,13 @@
 
 ## 🚀 Features
 
-✅ Detects typing in any editable field (`input`, `textarea`, or `contenteditable` elements)  
-✅ Waits for 2 seconds of inactivity before suggesting improvements  
-✅ Displays a smart **popup** near the editable element  
-✅ Uses **Gemini AI** to enhance the clarity, tone, and grammar of your text  
-✅ Allows users to **Accept**, **Reject**, or **Edit** the AI-enhanced suggestion  
-✅ Works seamlessly across all webpages  
-✅ Lightweight, secure, and built with **modern web technologies**
+ Detects typing in any editable field (`input`, `textarea`, or `contenteditable` elements)  
+ Waits for 2 seconds of inactivity before suggesting improvements  
+ Displays a smart **popup** near the editable element  
+ Uses **Gemini AI** to enhance the clarity, tone, and grammar of your text  
+ Allows users to **Accept**, **Reject**, or **Edit** the AI-enhanced suggestion  
+ Works seamlessly across all webpages  
+ Lightweight, secure, and built with **modern web technologies**
 
 ---
 
